@@ -829,10 +829,10 @@ def init_database():
     conn = sqlite3.connect('university.db')
     cursor = conn.cursor()
     
-    # Enable foreign key support (SQLite needs this for each connection)
+    # Enable foreign key support
     cursor.execute("PRAGMA foreign_keys = ON")
     
-    # Create Emp table (must come first due to circular reference)
+    # Create Emp table
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS emp (
         eno TEXT(4) PRIMARY KEY,
@@ -856,6 +856,44 @@ def init_database():
         FOREIGN KEY (manager) REFERENCES emp(eno) DEFERRABLE INITIALLY DEFERRED
     )
     ''')
+    
+    # Create code mapping table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS code_mapping (
+        category TEXT NOT NULL,
+        code TEXT NOT NULL,
+        value TEXT NOT NULL,
+        PRIMARY KEY (category, code)
+    )
+    ''')
+    
+    # Insert code mappings
+    mappings = [
+        # Department codes
+        ('dept', '数学学院', '01'),
+        ('dept', '计算机学院', '02'),
+        ('dept', '智能学院', '03'),
+        ('dept', '电子学院', '04'),
+        ('dept', '元培学院', '05'),
+        
+        # Position codes
+        ('position', '教师', '01'),
+        ('position', '教务', '02'),
+        ('position', '会计', '03'),
+        ('position', '秘书', '04'),
+        
+        # Level codes (same as value)
+        ('level', '1', '1'),
+        ('level', '2', '2'),
+        ('level', '3', '3'),
+        ('level', '4', '4'),
+        ('level', '5', '5'),
+    ]
+    
+    cursor.executemany(
+        "INSERT OR IGNORE INTO code_mapping VALUES (?, ?, ?)",
+        mappings
+    )
     
     conn.commit()
     return conn
@@ -956,6 +994,100 @@ def test_constraints(conn):
     
     conn.rollback()  # Rollback all test data
 
+def generate_smart_code(conn, eno):
+    """Generate a smart code for an employee based on their information"""
+    cursor = conn.cursor()
+    
+    # Get employee information
+    cursor.execute('''
+    SELECT e.eno, e.ename, e.birthday, e.level, e.position, e.salary, e.dno, d.dname
+    FROM emp e LEFT JOIN dept d ON e.dno = d.dno
+    WHERE e.eno = ?
+    ''', (eno,))
+    
+    emp = cursor.fetchone()
+    if not emp:
+        return None
+    
+    # Get code mappings
+    def get_mapping(category, value):
+        cursor.execute(
+            "SELECT code FROM code_mapping WHERE category = ? AND value = ?",
+            (category, str(value)))
+        result = cursor.fetchone()
+        return result[0] if result else '00'
+    
+    # Build smart code parts
+    parts = []
+    
+    # 1-4: Employee ID (padded to 4 digits)
+    parts.append(emp[0].zfill(4))
+    
+    # 5-6: Department code
+    dept_code = get_mapping('dept', emp[7]) if emp[7] else '00'
+    parts.append(dept_code)
+    
+    # 7-10: Birth year
+    birth_year = emp[2][:4] if emp[2] else '0000'
+    parts.append(birth_year)
+    
+    # 11-12: Position code
+    pos_code = get_mapping('position', emp[4]) if emp[4] else '00'
+    parts.append(pos_code)
+    
+    # 13: Level code
+    level_code = get_mapping('level', emp[3]) if emp[3] else '0'
+    parts.append(level_code)
+    
+    # 14-17: Salary grade (salary / 10000)
+    salary_grade = str(int(emp[5] // 10000)).zfill(4) if emp[5] else '0000'
+    parts.append(salary_grade)
+    
+    # Combine all parts
+    return ''.join(parts)
+
+def test_smart_code(conn):
+    """Test the smart code generation with sample data"""
+    cursor = conn.cursor()
+    
+    # Insert test data
+    test_data = [
+        # eno, ename, birthday, level, position, salary, dno
+        ('T001', '王教授', '1980-08-20', 5, '教师', 150000, 'D001'),
+        ('A001', '李会计', '1990-03-15', 3, '会计', 50000, 'D002'),
+        ('S001', '张秘书', '1995-11-05', 2, '秘书', 30000, None),
+    ]
+    
+    dept_data = [
+        # dno, dname, budget, manager
+        ('D001', '计算机学院', 5000000, 'T001'),
+        ('D002', '数学学院', 3000000, None),
+    ]
+    
+    cursor.executemany(
+        "INSERT OR IGNORE INTO emp VALUES (?, ?, ?, ?, ?, ?, ?)",
+        test_data
+    )
+    
+    cursor.executemany(
+        "INSERT OR IGNORE INTO dept VALUES (?, ?, ?, ?)",
+        dept_data
+    )
+    
+    conn.commit()
+    
+    # Generate and display smart codes
+    print("\nGenerated Smart Codes:")
+    for eno in ['T001', 'A001', 'S001']:
+        code = generate_smart_code(conn, eno)
+        print(f"{eno}: {code}")
+        
+        # Decode the smart code
+        if code:
+            print(f"  Decoded: ID={code[:4]}, Dept={code[4:6]}, Birth={code[6:10]}, "
+                  f"Position={code[10:12]}, Level={code[12]}, SalaryGrade={code[13:]}")
+
+
 def test():
     conn = init_database()
     
@@ -976,6 +1108,8 @@ def test():
     cursor.execute("SELECT * FROM dept WHERE dno = 'D001'")
     dept = cursor.fetchone()
     print("Department D001:", dept)
+
+    test_smart_code(conn)
     
     conn.close()
 ```
@@ -987,27 +1121,31 @@ test()
 #no-codly[
 ```
 
-=== 测试互相引用约束 ===
-成功插入互相引用的行
+=== Testing Circular Reference ===
+Failed to insert circular references: UNIQUE constraint failed: dept.dno
 
-=== 测试工资级别约束 ===
-正测试: 成功插入有效数据 (level=2, salary=8000)
-负测试: 成功捕获违反约束的操作 - CHECK constraint failed: (level = 1 AND salary BETWEEN 0 AND 5000) OR
-            (level = 2 AND salary BETWEEN 5001 AND 10000) OR
-            (level = 3 AND salary BETWEEN 10001 AND 15000) OR
-            (level = 4 AND salary BETWEEN 15001 AND 20000) OR
-            (level = 5 AND salary > 20000)
+=== Testing Constraints ===
 
-=== 测试智能码生成 ===
-生成的员工智能码: 020102198504040018
+Testing valid inserts:
+- Valid employee inserted
+- Valid department inserted
 
-智能码解析:
-员工编号: 0201
-部门编码: 02 (市场部)
-出生年份: 1985
-职位编码: 04 (总监)
-级别编码: 04 (4)
-工资等级: 0018 (18)
+Testing invalid inserts:
+- Caught invalid level (6): CHECK constraint failed: level BETWEEN 1 AND 5
+- Caught invalid position (校长): CHECK constraint failed: position IN ('教师', '教务', '会计', '秘书')
+- Caught invalid salary (1000): CHECK constraint failed: salary BETWEEN 2000 AND 200000
+- Caught invalid department name (物理学院): CHECK constraint failed: dname IN ('数学学院', '计算机学院', '智能学院', '电子学院', '元培学院')
+
+Employee E001: ('E001', '张教授', '1975-05-15', 4, '教师', 80000.0, 'D001')
+Department D001: ('D001', '计算机学院', 5000000.0, 'E001')
+
+Generated Smart Codes:
+T001: T0010019800050015
+  Decoded: ID=T001, Dept=00, Birth=1980, Position=00, Level=5, SalaryGrade=0015
+A001: A0010019900030005
+  Decoded: ID=A001, Dept=00, Birth=1990, Position=00, Level=3, SalaryGrade=0005
+S001: S0010019950020003
+  Decoded: ID=S001, Dept=00, Birth=1995, Position=00, Level=2, SalaryGrade=0003
 ```
 ]
 
